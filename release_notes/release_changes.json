@@ -1,0 +1,86 @@
+[
+  {
+    "path": "tools/train_utils/optimization/__init__.py",
+    "archived_sha256": "aa83865cc3473e9aa5a75c0367921e0a35ad9d7ee411d67637481cb016272113",
+    "release_sha256": "d0df3ce69de6db8df1136539fe24de179e7e8f254cd7fa9c145c62c3e51734b8",
+    "change": "optimizer coverage fix; see release_notes/optimizer_fix.diff (prior audited source plus this notice)."
+  },
+  {
+    "path": "pcdet/datasets/kitti/kitti_object_eval_python/evaluate.py",
+    "archived_sha256": "21a0b4f8db5b878fc4fde3facf47076a6df4560ba7e709831d8978ff4248edd2",
+    "release_sha256": "b6c54d25932790e8b4fb759fe22d6409f353104e60087361fe486d3aaa28cf98",
+    "change": "correct invalid Python relative-import syntax."
+  },
+  {
+    "path": "tools/train.py",
+    "archived_sha256": "d76fadbdecc7f327f135944a406c9eb16cc9afc837226ef135b65a6f02a6de1b",
+    "release_sha256": "dfbd2c359f888318795dc856c23d8e5e853cd579ce9fcd58f2209f086f7dc89c",
+    "change": "require the user to supply a configuration path."
+  },
+  {
+    "path": "tools/test.py",
+    "archived_sha256": "2cb2ef6f4ef25b9359f31338f7ea787fc992124ba26d3c2993ee65e8d6e0c163",
+    "release_sha256": "baafa0453e6e53c483750f3b02407eb82f693db39281c5c717e3f893b1b0653c",
+    "change": "require a config and remove the machine-specific checkpoint default."
+  },
+  {
+    "path": "pcdet/datasets/waymo/waymo_dataset.py",
+    "archived_sha256": "c0727587af7b7a7d0e2144629a213f7e9b0a20f2e107f791dbcfae1f28cb156d",
+    "release_sha256": "dd1fc44cf7d56923aa3521311095c6a9e3499a6c1d84a346d3fdbfd0c3584e20",
+    "change": "require a dataset configuration path."
+  },
+  {
+    "path": "pcdet/models/model_utils/split_voxels.py",
+    "archived_sha256": "825be608889a170931566640d0242bd2609125f8d0e7041c4c1aab139ddb80cd",
+    "release_sha256": "a63ce849a168ce96de575a8ecfc265cccc244ff8b36091be31bd7ebda3e486f7",
+    "change": "replace developer-specific visualization output path."
+  },
+  {
+    "path": "tools/cfgs/nuscenes_models/fshnet.yaml",
+    "archived_sha256": "6408f3508f93110bf5742d572e1a9587f7dcc70b2676f952e62e06ad8d6121cf",
+    "release_sha256": "6ce947d2555245c46af86c2a8f0ad174ccedb64d819856acf2df130601a3fa44",
+    "change": "use a project-relative base configuration path."
+  },
+  {
+    "path": "tools/cfgs/dataset_configs/waymo_dataset.yaml",
+    "archived_sha256": "a6a8472133bdc11ee7e3b60eb348675b8603127e617dce62f90e954e96de18f7",
+    "release_sha256": "c0898f4949585cbd38f5cfbca0b4a2d1952cf929a6b7bf989d693f42fe5ac457",
+    "change": "use a configurable project-relative data path."
+  },
+  {
+    "path": "tools/cfgs/kitti_models/fshnet_light_kitti.yaml",
+    "archived_sha256": "2717da7544ef397bd8d0e909e097fdeaac098ba017238ec81d8ef5dfb8006dc5",
+    "release_sha256": "1dc4e40851f39b8b00d8517028921a12cc3ff717008a4e662ae305d93b33165b",
+    "change": "use a project-relative dataset path; model switches are unchanged."
+  },
+  {
+    "path": "tools/cfgs/kitti_models/fshnet_light_kitti_corrected.yaml",
+    "archived_sha256": "c61ce2e7d2c10bbf5c333c8c9670340cb46ea65663f5737f71e1eaf3a93bd0e6",
+    "release_sha256": "89d99899a3f942f140c250c3ee06ea2cac2cb2d6a849053b970f35a3240cb3c3",
+    "change": "use a project-relative dataset path; model switches are unchanged."
+  },
+  {
+    "path": "tools/cfgs/kitti_models/fshnet_light_kitti_new_ablation.yaml",
+    "archived_sha256": "0b3e18648756b8ac03f4a7f1f915907f0cc4522efda5fe7f04de854bad408f0f",
+    "release_sha256": "464f4a75615a89ed385e5202c371a82c07dc7433806b7224d9a555b495d5b3fd",
+    "change": "use a project-relative dataset path; model switches are unchanged."
+  },
+  {
+    "path": "data/kitti/ImageSets/train.txt",
+    "archived_sha256": "b6417a1d9b18c8fdb085128e633d28ff321b7674a6d1b3841b8f43d865b281cb",
+    "release_sha256": "b6417a1d9b18c8fdb085128e633d28ff321b7674a6d1b3841b8f43d865b281cb",
+    "change": "KITTI split identifiers only; unchanged from input ZIP"
+  },
+  {
+    "path": "data/kitti/ImageSets/val.txt",
+    "archived_sha256": "657ac4bcc1e156e5b106a4ca18e1f88e012787ea1d2b5d0adeea97fee903fa86",
+    "release_sha256": "657ac4bcc1e156e5b106a4ca18e1f88e012787ea1d2b5d0adeea97fee903fa86",
+    "change": "KITTI split identifiers only; unchanged from input ZIP"
+  },
+  {
+    "path": "data/kitti/ImageSets/test.txt",
+    "archived_sha256": "a48fd4a14ec1dcff3b5f22ffa132efb9cb034d1370f370afcb4045d241786c6d",
+    "release_sha256": "a48fd4a14ec1dcff3b5f22ffa132efb9cb034d1370f370afcb4045d241786c6d",
+    "change": "KITTI split identifiers only; unchanged from input ZIP"
+  }
+]

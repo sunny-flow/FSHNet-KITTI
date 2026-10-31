@@ -1,0 +1,41 @@
+--- archive/tools/train_utils/optimization/__init__.py
++++ release/tools/train_utils/optimization/__init__.py
+@@ -23,7 +23,15 @@
+         def num_children(m: nn.Module) -> int:
+             return len(children(m))
+ 
+-        flatten_model = lambda m: sum(map(flatten_model, m.children()), []) if num_children(m) else [m]
++        def flatten_model(m: nn.Module):
++            if not num_children(m):
++                return [m]
++            layers = sum(map(flatten_model, m.children()), [])
++            # Keep original Parameter objects registered directly on non-leaves.
++            direct_params = [p for p in m.parameters(recurse=False) if p.requires_grad]
++            if direct_params:
++                layers.append(nn.ParameterList(direct_params))
++            return layers
+         get_layer_groups = lambda m: [nn.Sequential(*flatten_model(m))]
+         betas = optim_cfg.get('BETAS', (0.9, 0.99))
+         betas = tuple(betas)
+@@ -50,6 +58,21 @@
+     else:
+         raise NotImplementedError
+ 
++    # Audit every optimizer type, including wrapped optimizers, before return.
++    parameter_names = {id(p): name for name, p in model.named_parameters()}
++    locations = {}
++    for group_index, group in enumerate(optimizer.param_groups):
++        for parameter_index, parameter in enumerate(group['params']):
++            locations.setdefault(id(parameter), []).append((group_index, parameter_index))
++    missing = [name for name, parameter in model.named_parameters()
++               if parameter.requires_grad and id(parameter) not in locations]
++    duplicates = {parameter_names.get(identity, '<unnamed>'): positions
++                  for identity, positions in locations.items() if len(positions) > 1}
++    if missing or duplicates:
++        raise RuntimeError(
++            'Optimizer parameter coverage audit failed: missing trainable parameters=%s; '
++            'duplicate parameter references (group, index)=%s' % (missing, duplicates)
++        )
+     return optimizer
+ 
+ 
