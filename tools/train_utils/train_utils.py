@@ -4,134 +4,357 @@ import torch
 import tqdm
 import time
 import glob
-#改进0：工程修复——支持逐epoch验证、最佳指标持久化及best checkpoint保存。
-import json
-import math
-import shutil
-from pathlib import Path
-#end
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
-#改进0：工程修复——复用统一验证入口；KITTI AP会在该入口中自动切换到独立进程。
+
+#改进13：仅用标准库检查训练标量是否为有限值，不改变优化器、AMP或损失权重。
+import math
+#end
+
+#改进0：逐epoch评估、指标表格和最佳checkpoint持久化所需的标准库与现有评估模块。
+import json
+import re
+import shutil
+from pathlib import Path
 from eval_utils import eval_utils
 #end
 
-#改进0：工程修复——原子记录最佳指标，并独立保存best_model.pth避免被常规checkpoint轮转删除。
-def update_best_performance(model, optimizer, epoch, accumulated_iter, metrics,
-                            best_metric, ckpt_save_dir, logger):
-    serializable_metrics = {}
-    for key, value in metrics.items():
-        try:
-            serializable_metrics[key] = float(value)
-        except (TypeError, ValueError):
-            continue
 
-    if best_metric not in serializable_metrics:
-        raise KeyError(
-            'Best metric %s is absent. Available metrics: %s'
-            % (best_metric, sorted(serializable_metrics.keys()))
+#改进0：将KITTI R40核心指标格式化为固定列宽表格，便于跨epoch和消融实验直接比较。
+def format_epoch_performance_table(epoch, train_loss, metrics, class_names):
+    #改进12：nuScenes只报告真实mAP/NDS，不套用KITTI的R40类别表。
+    if 'mAP' in metrics and 'NDS' in metrics:
+        return ('Epoch %d performance | train_loss=%s\n'
+                '+----------+----------+\n'
+                '| mAP      | NDS      |\n'
+                '+----------+----------+\n'
+                '| %8.4f | %8.4f |\n'
+                '+----------+----------+' % (
+                    epoch,
+                    '--' if train_loss is None else '%.6f' % float(train_loss),
+                    float(metrics['mAP']), float(metrics['NDS'])))
+    #end
+    metric_columns = [
+        ('BBox-M', 'image', 'moderate'),
+        ('BEV-M', 'bev', 'moderate'),
+        ('3D-E', '3d', 'easy'),
+        ('3D-M', '3d', 'moderate'),
+        ('3D-H', '3d', 'hard'),
+        ('AOS-M', 'aos', 'moderate'),
+    ]
+
+    def metric_value(class_name, metric_name, difficulty):
+        key = '%s_%s/%s_R40' % (
+            class_name, metric_name, difficulty
         )
-    current_value = serializable_metrics[best_metric]
-    if not math.isfinite(current_value):
-        raise ValueError('Best metric %s is not finite: %s' % (best_metric, current_value))
-
-    summary_path = Path(ckpt_save_dir).parent / 'best_metrics.json'
-    previous_summary = {}
-    if summary_path.exists():
+        value = metrics.get(key, None)
+        if value is None:
+            return None
         try:
-            with open(summary_path, 'r', encoding='utf-8') as f:
-                previous_summary = json.load(f)
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for class_name in class_names:
+        rows.append([
+            class_name,
+            *[
+                metric_value(class_name, metric_name, difficulty)
+                for _, metric_name, difficulty in metric_columns
+            ]
+        ])
+
+    mean_row = ['Mean']
+    for _, metric_name, difficulty in metric_columns:
+        values = [
+            metric_value(class_name, metric_name, difficulty)
+            for class_name in class_names
+        ]
+        values = [value for value in values if value is not None]
+        mean_row.append(sum(values) / len(values) if values else None)
+    rows.append(mean_row)
+
+    headers = ['Class'] + [column[0] for column in metric_columns]
+    formatted_rows = []
+    for row in rows:
+        formatted_rows.append([
+            str(row[0]),
+            *[
+                '--' if value is None else '%.4f' % value
+                for value in row[1:]
+            ]
+        ])
+    widths = [
+        max(len(headers[column]), *[
+            len(row[column]) for row in formatted_rows
+        ])
+        for column in range(len(headers))
+    ]
+
+    def render(row):
+        return '| ' + ' | '.join(
+            value.ljust(widths[index])
+            for index, value in enumerate(row)
+        ) + ' |'
+
+    separator = '+-' + '-+-'.join('-' * width for width in widths) + '-+'
+    lines = [
+        'Epoch %d performance (AP_R40, %%) | train_loss=%s' % (
+            epoch,
+            '--' if train_loss is None else '%.6f' % float(train_loss)
+        ),
+        separator,
+        render(headers),
+        separator,
+    ]
+    lines.extend(render(row) for row in formatted_rows)
+    lines.append(separator)
+    return '\n'.join(lines)
+
+
+def _write_json_atomic(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + '.tmp')
+    with temporary_path.open('w', encoding='utf-8') as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write('\n')
+    temporary_path.replace(path)
+
+
+def update_best_performance(
+        model, optimizer, epoch, accumulated_iter, metrics,
+        metric_name, ckpt_save_dir, logger):
+    ckpt_save_dir = Path(ckpt_save_dir)
+    summary_path = ckpt_save_dir.parent / 'best_metrics.json'
+    previous = {}
+    if summary_path.is_file():
+        try:
+            with summary_path.open('r', encoding='utf-8') as stream:
+                previous = json.load(stream)
         except (OSError, ValueError):
-            logger.warning('Ignore unreadable best metric summary: %s' % summary_path)
+            logger.warning(
+                'Ignore unreadable best metric summary: %s' % summary_path
+            )
 
-    same_metric = previous_summary.get('best_metric') == best_metric
-    previous_best = float(previous_summary.get('best_value', -math.inf)) if same_metric else -math.inf
-    is_best = current_value > previous_best
-
+    if metric_name not in metrics:
+        raise KeyError(
+            'Best metric %s is absent from epoch %d results. Available: %s' % (
+                metric_name, epoch, sorted(metrics.keys())
+            )
+        )
+    latest_value = float(metrics[metric_name])
+    best_value = float(previous.get('best_value', float('-inf')))
+    is_best = latest_value > best_value
     if is_best:
+        best_value = latest_value
         best_epoch = int(epoch)
-        best_value = current_value
-        best_checkpoint = Path(ckpt_save_dir) / 'best_model.pth'
         save_checkpoint(
             checkpoint_state(model, optimizer, epoch, accumulated_iter),
-            filename=Path(ckpt_save_dir) / 'best_model'
-        )
-        logger.info(
-            'New best %s: %.6f at epoch %d; saved to %s'
-            % (best_metric, best_value, best_epoch, best_checkpoint)
+            filename=ckpt_save_dir / 'best_model'
         )
     else:
-        best_epoch = int(previous_summary['best_epoch'])
-        best_value = previous_best
-        best_checkpoint = Path(previous_summary['best_checkpoint'])
-        logger.info(
-            'Current %s %.6f did not exceed best %.6f at epoch %d'
-            % (best_metric, current_value, best_value, best_epoch)
-        )
+        best_epoch = int(previous.get('best_epoch', epoch))
 
     summary = {
-        'best_metric': best_metric,
+        'metric_name': metric_name,
         'best_value': best_value,
         'best_epoch': best_epoch,
-        'best_checkpoint': str(best_checkpoint),
+        'latest_value': latest_value,
         'latest_epoch': int(epoch),
-        'latest_value': current_value,
-        'latest_metrics': serializable_metrics,
     }
-    temporary_path = summary_path.with_suffix(summary_path.suffix + '.tmp')
-    with open(temporary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, sort_keys=True, ensure_ascii=False)
-        f.write('\n')
-    temporary_path.replace(summary_path)
+    _write_json_atomic(summary_path, summary)
+    if is_best:
+        logger.info(
+            'New best %s: %.6f at epoch %d; saved to %s' % (
+                metric_name, best_value, best_epoch,
+                ckpt_save_dir / 'best_model.pth'
+            )
+        )
+    else:
+        logger.info(
+            'Best %s remains %.6f at epoch %d (current %.6f)' % (
+                metric_name, best_value, best_epoch, latest_value
+            )
+        )
     return summary, is_best
-#end
 
-#改进0：工程修复——断点续训时可从已有逐epoch指标恢复最佳模型，覆盖评估后异常退出场景。
-def recover_best_performance(ckpt_save_dir, eval_output_dir, best_metric, logger):
-    summary_path = Path(ckpt_save_dir).parent / 'best_metrics.json'
-    if summary_path.exists() or eval_output_dir is None:
-        return
 
+def recover_best_performance(
+        ckpt_save_dir, eval_output_dir, metric_name, logger):
+    ckpt_save_dir = Path(ckpt_save_dir)
+    eval_output_dir = Path(eval_output_dir)
     candidates = []
-    for metrics_path in Path(eval_output_dir).glob('epoch_*/**/kitti_metrics.json'):
+    summary_path = ckpt_save_dir.parent / 'best_metrics.json'
+    existing_best_path = ckpt_save_dir / 'best_model.pth'
+    if summary_path.is_file() and existing_best_path.is_file():
         try:
-            epoch = int(metrics_path.parents[1].name.split('_')[-1])
-            with open(metrics_path, 'r', encoding='utf-8') as f:
-                metrics = json.load(f)
-            metric_value = float(metrics[best_metric])
-            checkpoint_path = Path(ckpt_save_dir) / ('checkpoint_epoch_%d.pth' % epoch)
-            if math.isfinite(metric_value) and checkpoint_path.exists():
-                candidates.append((metric_value, epoch, metrics, checkpoint_path))
-        except (OSError, ValueError, KeyError, IndexError):
+            with summary_path.open('r', encoding='utf-8') as stream:
+                existing_summary = json.load(stream)
+            if existing_summary.get('metric_name') == metric_name:
+                candidates.append((
+                    float(existing_summary['best_value']),
+                    int(existing_summary['best_epoch']),
+                    existing_best_path,
+                ))
+        except (KeyError, OSError, ValueError, TypeError):
+            logger.warning(
+                'Ignore invalid existing best summary: %s' % summary_path
+            )
+    #改进12：恢复最佳模型时同时识别nuScenes与KITTI已完成的真实评估指标。
+    metrics_files = list(eval_output_dir.glob('epoch_*/val/kitti_metrics.json'))
+    metrics_files += list(eval_output_dir.glob('epoch_*/val/nuscenes_metrics.json'))
+    for metrics_path in metrics_files:
+        match = re.match(r'^epoch_(\d+)$', metrics_path.parents[1].name)
+        if match is None:
             continue
+        epoch = int(match.group(1))
+        checkpoint_path = ckpt_save_dir / (
+            'checkpoint_epoch_%d.pth' % epoch
+        )
+        if not checkpoint_path.is_file():
+            continue
+        try:
+            with metrics_path.open('r', encoding='utf-8') as stream:
+                metrics = json.load(stream)
+            if metric_name in metrics:
+                candidates.append((
+                    float(metrics[metric_name]), epoch, checkpoint_path
+                ))
+        except (OSError, ValueError, TypeError):
+            logger.warning('Ignore invalid metrics file: %s' % metrics_path)
+    #end
 
     if not candidates:
-        return
-    best_value, best_epoch, best_metrics, checkpoint_path = max(
-        candidates, key=lambda item: item[0]
+        return None
+    best_value, best_epoch, checkpoint_path = max(
+        candidates, key=lambda item: (item[0], item[1])
     )
-    best_checkpoint = Path(ckpt_save_dir) / 'best_model.pth'
-    temporary_checkpoint = best_checkpoint.with_suffix('.pth.tmp')
-    shutil.copy2(checkpoint_path, temporary_checkpoint)
-    temporary_checkpoint.replace(best_checkpoint)
+    best_path = ckpt_save_dir / 'best_model.pth'
+    if checkpoint_path.resolve() != best_path.resolve():
+        shutil.copy2(str(checkpoint_path), str(best_path))
     summary = {
-        'best_metric': best_metric,
+        'metric_name': metric_name,
         'best_value': best_value,
         'best_epoch': best_epoch,
-        'best_checkpoint': str(best_checkpoint),
-        'latest_epoch': best_epoch,
         'latest_value': best_value,
-        'latest_metrics': {key: float(value) for key, value in best_metrics.items()},
+        'latest_epoch': best_epoch,
     }
-    temporary_summary = summary_path.with_suffix(summary_path.suffix + '.tmp')
-    with open(temporary_summary, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, sort_keys=True, ensure_ascii=False)
-        f.write('\n')
-    temporary_summary.replace(summary_path)
+    _write_json_atomic(summary_path, summary)
     logger.info(
-        'Recovered best %s %.6f from epoch %d'
-        % (best_metric, best_value, best_epoch)
+        'Recovered best %s %.6f at epoch %d from %s' % (
+            metric_name, best_value, best_epoch, checkpoint_path
+        )
     )
+    return summary
+
+
+def cleanup_completed_eval_artifacts(
+        eval_output_dir, logger, keep_prediction_epochs=0):
+    eval_output_dir = Path(eval_output_dir)
+    if keep_prediction_epochs < 0 or not eval_output_dir.exists():
+        return {'removed_files': 0, 'removed_bytes': 0}
+
+    completed_epochs = []
+    for result_path in eval_output_dir.glob('epoch_*/val/result.pkl'):
+        #改进12：仅在对应数据集指标文件存在时清理预测缓存，保留失败评估现场。
+        metrics_ready = any((result_path.parent / name).is_file() for name in
+                            ('kitti_metrics.json', 'nuscenes_metrics.json'))
+        match = re.match(r'^epoch_(\d+)$', result_path.parents[1].name)
+        if metrics_ready and match is not None:
+            completed_epochs.append((int(match.group(1)), result_path))
+        #end
+    completed_epochs.sort(key=lambda item: item[0])
+
+    if keep_prediction_epochs > 0:
+        removable = completed_epochs[:-keep_prediction_epochs]
+    else:
+        removable = completed_epochs
+
+    removed_files = 0
+    removed_bytes = 0
+    for _, result_path in removable:
+        if result_path.is_file():
+            removed_bytes += result_path.stat().st_size
+            result_path.unlink()
+            removed_files += 1
+
+        final_result_dir = result_path.parent / 'final_result'
+        #改进12：nuScenes保留官方metrics_summary与结果JSON，避免清理时丢失分类别证据。
+        if final_result_dir.is_dir() and not (result_path.parent / 'nuscenes_metrics.json').is_file():
+            for file_path in final_result_dir.rglob('*'):
+                if file_path.is_file():
+                    removed_bytes += file_path.stat().st_size
+                    removed_files += 1
+            shutil.rmtree(str(final_result_dir))
+        #end
+
+    if removed_files > 0:
+        logger.info(
+            'Cleaned %d completed-evaluation prediction files (%.3f GiB). '
+            'Metrics tables and failed-evaluation predictions were preserved.' % (
+                removed_files, removed_bytes / float(1024 ** 3)
+            )
+        )
+    return {
+        'removed_files': removed_files,
+        'removed_bytes': removed_bytes,
+    }
+#end
+
+#改进14：仅在训练损失异常时检查已有输入、稀疏特征、预测和目标，定位首个非有限阶段。
+def describe_nonfinite_training_tensors(model, batch):
+    checked = []
+    invalid = []
+
+    def inspect(label, value, row_indices=None):
+        tensor = value.features if hasattr(value, 'features') else value
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+            return
+        checked.append(label)
+        with torch.no_grad():
+            bad = ~torch.isfinite(tensor.detach())
+            bad_count = int(bad.sum().item())
+            if bad_count:
+                first = torch.nonzero(bad, as_tuple=False)[0].cpu().tolist()
+                sparse_indices = row_indices if row_indices is not None else getattr(value, 'indices', None)
+                batch_index = None
+                if (isinstance(sparse_indices, torch.Tensor) and first
+                        and first[0] < sparse_indices.shape[0]):
+                    batch_index = int(sparse_indices[first[0], 0].item())
+                invalid.append('%s: bad=%d/%d, first_index=%s, batch_index=%s' % (
+                    label, bad_count, tensor.numel(), first, batch_index
+                ))
+
+    for key in ('points', 'voxel_features', 'gt_boxes'):
+        inspect('input.' + key, batch.get(key))
+    for key, value in batch.get('multi_scale_3d_features', {}).items():
+        inspect('backbone.' + key, value)
+    inspect('backbone.shared_output', batch.get('spatial_features_2d'))
+
+    network = model.module if hasattr(model, 'module') else model
+    head = getattr(network, 'dense_head', None)
+    if head is not None:
+        saved = getattr(head, 'forward_ret_dict', {})
+        prediction_indices = saved.get('spatial_indices')
+        for head_index, prediction in enumerate(saved.get('pred_dicts', [])):
+            for key, value in prediction.items():
+                inspect('prediction.%d.%s' % (head_index, key), value,
+                        prediction_indices)
+        for key, values in saved.get('target_dicts', {}).items():
+            if isinstance(values, (list, tuple)):
+                for head_index, value in enumerate(values):
+                    inspect('target.%d.%s' % (head_index, key), value)
+
+    bad_parameters = []
+    for name, parameter in network.named_parameters():
+        if not torch.isfinite(parameter.detach()).all().item():
+            bad_parameters.append(name)
+            if len(bad_parameters) == 8:
+                break
+    return {'checked': checked, 'invalid': invalid,
+            'nonfinite_parameters_first_8': bad_parameters}
 #end
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
@@ -145,6 +368,23 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
     start_it = accumulated_iter % total_it_each_epoch
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp, init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
+
+    #改进15：AMP仅检查优化器参数；训练前确认所有可训练参数都在其中，并以同一集合裁剪梯度。
+    optimizer_parameters = [
+        param for group in optimizer.param_groups for param in group['params']
+        if param.requires_grad
+    ]
+    optimizer_parameter_ids = {id(param) for param in optimizer_parameters}
+    untracked_parameters = [
+        name for name, param in model.named_parameters()
+        if param.requires_grad and id(param) not in optimizer_parameter_ids
+    ]
+    if untracked_parameters:
+        raise RuntimeError(
+            'Trainable parameters are absent from the optimizer/AMP checks: %s' %
+            untracked_parameters
+        )
+    #end
     
     if rank == 0:
         pbar = tqdm.tqdm(total=total_it_each_epoch, leave=leave_pbar, desc='train', dynamic_ncols=True)
@@ -184,35 +424,51 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         with torch.cuda.amp.autocast(enabled=use_amp): 
             loss, tb_dict, disp_dict = model_func(model, batch)
 
-        #改进0：工程修复——在非有限loss污染优化器和checkpoint前立即停止，并报告具体loss分项。
-        if not bool(torch.isfinite(loss.detach()).all().item()):
-            non_finite_terms = {}
-            for key, value in tb_dict.items():
-                try:
-                    numeric_value = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(numeric_value):
-                    non_finite_terms[key] = numeric_value
-            optimizer.zero_grad()
-            raise FloatingPointError(
-                'Non-finite training loss at epoch %d iteration %d; terms=%s'
-                % (cur_epoch + 1, cur_it + 1, non_finite_terms)
-            )
-        #end
-
-        #改进0：工程修复——在KITTI训练进度中显示分类、定位和IoU loss，便于定位数值来源。
+        #改进13：首次非有限loss即停止，记录分项与样本，防止继续训练或保存无效权重。
+        nonfinite_terms = {}
+        if not torch.isfinite(loss.detach()).all().item():
+            nonfinite_terms['loss'] = float(loss.detach().float().mean().item())
         for term_name, term_value in tb_dict.items():
-            if term_name.startswith(('hm_loss_', 'loc_loss_', 'iou_loss_')):
-                try:
-                    disp_dict[term_name] = '%.3f' % float(term_value)
-                except (TypeError, ValueError):
-                    continue
+            if isinstance(term_value, (int, float)):
+                scalar = float(term_value)
+            elif isinstance(term_value, torch.Tensor) and term_value.numel() == 1:
+                scalar = float(term_value.detach().item())
+            else:
+                continue
+            if not math.isfinite(scalar):
+                nonfinite_terms[term_name] = scalar
+        if nonfinite_terms:
+            frame_ids = repr(batch.get('frame_id', None))
+            metadata = batch.get('metadata', None)
+            sample_tokens = None
+            if isinstance(metadata, dict):
+                metadata = [metadata]
+            if metadata is not None:
+                sample_tokens = [
+                    item.get('token', item.get('sample_token'))
+                    for item in metadata if isinstance(item, dict)
+                ]
+            #改进14：同时报告输入与模型各阶段的有限性；只在失败时同步GPU张量。
+            tensor_report = describe_nonfinite_training_tensors(model, batch)
+            #end
+            raise FloatingPointError(
+                'Non-finite training loss before backward at epoch %s, '
+                'iteration %d, global iteration %d; frame_id=%s, '
+                'sample_tokens=%s, amp_scale=%s, terms=%s, tensor_report=%s' % (
+                    str(cur_epoch + 1 if cur_epoch is not None else None),
+                    cur_it + 1, accumulated_iter, frame_ids,
+                    repr(sample_tokens),
+                    str(scaler.get_scale()) if use_amp else 'disabled',
+                    nonfinite_terms, tensor_report,
+                )
+            )
         #end
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+        #改进15：裁剪范围与GradScaler反缩放范围一致，避免遗漏参数的梯度污染全部更新。
+        clip_grad_norm_(optimizer_parameters, optim_cfg.GRAD_NORM_CLIP)
+        #end
         scaler.step(optimizer)
         scaler.update()
 
@@ -303,27 +559,84 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         return accumulated_iter, None
 
 
-#改进0：工程修复——训练循环接收逐epoch验证所需对象和最佳指标名称，默认关闭以兼容其他调用方。
+#改进0：训练循环接收唯一的逐epoch验证DataLoader、输出目录和最佳指标设置。
 def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None,
-                show_gpu_stat=False, cfg=None, eval_loader=None, eval_args=None, eval_output_dir=None,
-                eval_interval=0, best_metric='mean_3d/moderate_R40'):
+                show_gpu_stat=False, cfg=None, eval_loader=None, eval_args=None,
+                eval_output_dir=None, eval_interval=1,
+                best_metric='mean_3d/moderate_R40',
+                max_eval_prediction_epochs=0):
 #end
     accumulated_iter = start_iter
 
-    # use for disable data augmentation hook
-    hook_config = cfg.get('HOOK', None) 
-    augment_disable_flag = False
-
-    #改进0：工程修复——进入续训循环前恢复此前已成功计算但尚未登记的最佳指标。
-    if rank == 0 and eval_loader is not None:
+    #改进0：断点续训先回收已完成评估的大型预测，再恢复best_model；指标表格与失败现场不删除。
+    if rank == 0 and eval_loader is not None and eval_output_dir is not None:
+        cleanup_completed_eval_artifacts(
+            eval_output_dir, logger,
+            keep_prediction_epochs=max_eval_prediction_epochs
+        )
         recover_best_performance(
             ckpt_save_dir, eval_output_dir, best_metric, logger
         )
     #end
+
+    #改进0：checkpoint已保存但评估中断时，续训先补齐该epoch且仅补一次，再进入下一轮训练。
+    if eval_loader is not None and eval_args is not None \
+            and eval_output_dir is not None and eval_interval > 0 \
+            and start_epoch > 0 and start_epoch % eval_interval == 0:
+        resume_result_dir = (
+            Path(eval_output_dir)
+            / ('epoch_%d' % start_epoch)
+            / cfg.DATA_CONFIG.DATA_SPLIT['test']
+        )
+        #改进12：nuScenes续训按nuScenes指标文件判断是否需要补评，避免每次重复验证。
+        metrics_name = ('nuscenes_metrics.json' if cfg.MODEL.POST_PROCESSING.EVAL_METRIC == 'nuscenes'
+                        else 'kitti_metrics.json')
+        resume_metrics_path = resume_result_dir / metrics_name
+        #end
+        if not resume_metrics_path.is_file():
+            is_distributed = isinstance(
+                model, torch.nn.parallel.DistributedDataParallel
+            )
+            if is_distributed:
+                torch.distributed.barrier()
+            eval_model = model.module if is_distributed else model
+            logger.info(
+                'Checkpoint epoch %d has no completed metrics; run one catch-up evaluation.' %
+                start_epoch
+            )
+            resume_metrics = eval_utils.eval_one_epoch(
+                cfg, eval_args, eval_model, eval_loader,
+                start_epoch, logger,
+                dist_test=is_distributed,
+                result_dir=resume_result_dir,
+            )
+            if rank == 0:
+                performance_table = format_epoch_performance_table(
+                    start_epoch, None, resume_metrics, cfg.CLASS_NAMES
+                )
+                logger.info('\n%s' % performance_table)
+                (resume_result_dir / 'performance_table.txt').write_text(
+                    performance_table + '\n', encoding='utf-8'
+                )
+                update_best_performance(
+                    model, optimizer, start_epoch, accumulated_iter,
+                    resume_metrics, best_metric, ckpt_save_dir, logger
+                )
+                cleanup_completed_eval_artifacts(
+                    eval_output_dir, logger,
+                    keep_prediction_epochs=max_eval_prediction_epochs
+                )
+            model.train()
+            torch.cuda.empty_cache()
+    #end
+
+    # use for disable data augmentation hook
+    hook_config = cfg.get('HOOK', None) 
+    augment_disable_flag = False
 
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
@@ -364,7 +677,9 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
 
             torch.cuda.empty_cache()
             if rank == 0:
-                logger.info("epoch{}_losses: {}".format(cur_epoch, batch_loss))
+                #改进0：日志使用与checkpoint和性能表一致的1-based epoch编号，避免看似重复一轮。
+                logger.info("epoch{}_losses: {}".format(cur_epoch + 1, batch_loss))
+                #end
                 batch_losses.append(batch_loss)
 
             # save trained model
@@ -383,59 +698,62 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                     checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
                 )
 
-            #改进0：工程修复——按配置在epoch结束后执行一次验证、记录指标并保留最佳checkpoint。
+            #改进0：每个指定epoch只在此处验证一次，打印表格并按mean 3D Moderate R40保存最佳模型。
             should_evaluate = (
-                rank == 0 and eval_loader is not None and eval_interval > 0
+                eval_loader is not None
+                and eval_args is not None
+                and eval_output_dir is not None
+                and eval_interval > 0
                 and trained_epoch % eval_interval == 0
             )
             if should_evaluate:
-                epoch_result_dir = (
-                    Path(eval_output_dir) / ('epoch_%d' % trained_epoch)
+                is_distributed = isinstance(
+                    model, torch.nn.parallel.DistributedDataParallel
+                )
+                eval_model = model.module if is_distributed else model
+                result_dir = (
+                    Path(eval_output_dir)
+                    / ('epoch_%d' % trained_epoch)
                     / cfg.DATA_CONFIG.DATA_SPLIT['test']
                 )
                 logger.info(
-                    '**********************Start epoch %d isolated evaluation**********************'
-                    % trained_epoch
+                    '**********************Start epoch %d evaluation**********************' %
+                    trained_epoch
                 )
-                torch.cuda.empty_cache()
-                eval_model = model.module if isinstance(
-                    model, torch.nn.parallel.DistributedDataParallel
-                ) else model
-                try:
-                    epoch_metrics = eval_utils.eval_one_epoch(
-                        cfg, eval_args, eval_model, eval_loader, trained_epoch,
-                        logger, dist_test=False, result_dir=epoch_result_dir
+                epoch_metrics = eval_utils.eval_one_epoch(
+                    cfg, eval_args, eval_model, eval_loader,
+                    trained_epoch, logger,
+                    dist_test=is_distributed,
+                    result_dir=result_dir,
+                )
+                if rank == 0:
+                    performance_table = format_epoch_performance_table(
+                        trained_epoch, batch_loss, epoch_metrics,
+                        cfg.CLASS_NAMES
                     )
-                    summary, _ = update_best_performance(
-                        model, optimizer, trained_epoch, accumulated_iter,
-                        epoch_metrics, best_metric, ckpt_save_dir, logger
+                    logger.info('\n%s' % performance_table)
+                    result_dir.mkdir(parents=True, exist_ok=True)
+                    (result_dir / 'performance_table.txt').write_text(
+                        performance_table + '\n', encoding='utf-8'
                     )
-                    if tb_log is not None:
-                        for metric_name, metric_value in summary['latest_metrics'].items():
-                            tb_log.add_scalar('eval/' + metric_name, metric_value, trained_epoch)
-                        tb_log.add_scalar('eval/best_value', summary['best_value'], trained_epoch)
-                except Exception as eval_error:
-                    error_path = epoch_result_dir / 'evaluation_error.json'
-                    with open(error_path, 'w', encoding='utf-8') as f:
-                        json.dump({
-                            'epoch': trained_epoch,
-                            'error_type': type(eval_error).__name__,
-                            'error': str(eval_error),
-                            'result_pkl': str(epoch_result_dir / 'result.pkl'),
-                        }, f, indent=2, ensure_ascii=False)
-                        f.write('\n')
-                    logger.exception(
-                        'Epoch %d evaluation failed; training will continue. Details: %s'
-                        % (trained_epoch, error_path)
+                    for key, value in epoch_metrics.items():
+                        if tb_log is not None:
+                            tb_log.add_scalar(
+                                'eval/' + key, float(value), trained_epoch
+                            )
+                    update_best_performance(
+                        model, optimizer, trained_epoch,
+                        accumulated_iter, epoch_metrics,
+                        best_metric, ckpt_save_dir, logger
+                    )
+                    cleanup_completed_eval_artifacts(
+                        eval_output_dir, logger,
+                        keep_prediction_epochs=max_eval_prediction_epochs
                     )
                 model.train()
                 torch.cuda.empty_cache()
-                logger.info(
-                    '**********************End epoch %d isolated evaluation**********************'
-                    % trained_epoch
-                )
             #end
-
+                 
         logger.info("batch_losses: {}".format(batch_losses))
 
 
