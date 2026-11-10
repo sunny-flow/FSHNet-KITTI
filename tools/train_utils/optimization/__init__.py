@@ -1,4 +1,3 @@
-# Release adaptation: optimizer coverage fix; see release_notes/optimizer_fix.diff (prior audited source plus this notice).
 from functools import partial
 
 import torch.nn as nn
@@ -24,15 +23,7 @@ def build_optimizer(model, optim_cfg):
         def num_children(m: nn.Module) -> int:
             return len(children(m))
 
-        def flatten_model(m: nn.Module):
-            if not num_children(m):
-                return [m]
-            layers = sum(map(flatten_model, m.children()), [])
-            # Keep original Parameter objects registered directly on non-leaves.
-            direct_params = [p for p in m.parameters(recurse=False) if p.requires_grad]
-            if direct_params:
-                layers.append(nn.ParameterList(direct_params))
-            return layers
+        flatten_model = lambda m: sum(map(flatten_model, m.children()), []) if num_children(m) else [m]
         get_layer_groups = lambda m: [nn.Sequential(*flatten_model(m))]
         betas = optim_cfg.get('BETAS', (0.9, 0.99))
         betas = tuple(betas)
@@ -59,21 +50,38 @@ def build_optimizer(model, optim_cfg):
     else:
         raise NotImplementedError
 
-    # Audit every optimizer type, including wrapped optimizers, before return.
-    parameter_names = {id(p): name for name, p in model.named_parameters()}
+    #改进15：fastai叶模块分组会遗漏父模块直接注册的Parameter（如RPDI的rpdi_scale）。
+    #把遗漏参数纳入已有非BN组，使AMP反缩放、溢出检测、梯度裁剪和Adam更新覆盖同一集合。
+    optimizer_param_ids = {
+        id(param) for group in optimizer.param_groups for param in group['params']
+    }
+    missing = [
+        (name, param) for name, param in model.named_parameters()
+        if param.requires_grad and id(param) not in optimizer_param_ids
+    ]
+    if missing:
+        optimizer.param_groups[0]['params'].extend(param for _, param in missing)
+        print('Optimizer included previously omitted trainable parameters: %s' %
+              [name for name, _ in missing])
     locations = {}
     for group_index, group in enumerate(optimizer.param_groups):
-        for parameter_index, parameter in enumerate(group['params']):
-            locations.setdefault(id(parameter), []).append((group_index, parameter_index))
-    missing = [name for name, parameter in model.named_parameters()
-               if parameter.requires_grad and id(parameter) not in locations]
-    duplicates = {parameter_names.get(identity, '<unnamed>'): positions
-                  for identity, positions in locations.items() if len(positions) > 1}
-    if missing or duplicates:
+        for parameter_index, param in enumerate(group['params']):
+            locations.setdefault(id(param), []).append((group_index, parameter_index))
+    remaining = [
+        name for name, param in model.named_parameters()
+        if param.requires_grad and id(param) not in locations
+    ]
+    parameter_names = {id(param): name for name, param in model.named_parameters()}
+    duplicates = {
+        parameter_names.get(identity, '<unnamed>'): positions
+        for identity, positions in locations.items() if len(positions) > 1
+    }
+    if remaining or duplicates:
         raise RuntimeError(
-            'Optimizer parameter coverage audit failed: missing trainable parameters=%s; '
-            'duplicate parameter references (group, index)=%s' % (missing, duplicates)
+            'Optimizer parameter coverage failed: missing=%s; duplicate (group, index)=%s'
+            % (remaining, duplicates)
         )
+    #end
     return optimizer
 
 
